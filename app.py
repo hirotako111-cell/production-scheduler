@@ -7,10 +7,9 @@ from datetime import datetime
 # --- ページ設定 ---
 st.set_page_config(page_title="生産計画カンバン・ダッシュボード", layout="wide")
 st.title("🏭 生産計画カンバン・ダッシュボード")
-st.markdown("基幹システムから出力した本日の各種CSVデータをサイドバーからアップロードしてください。")
+st.markdown("基幹システムから出力した本日の各種データ（CSVまたはExcel）をサイドバーからアップロードしてください。")
 
 # --- 初期設定 ---
-# 本日の日付（※シミュレーション基準日）
 CURRENT_SIM_DATE = datetime(2026, 4, 2)
 color_rank = { 'WE': 1, 'YL': 2, 'GD': 3, 'OE': 4, 'PINK': 5, 'RD': 6, 'GN': 7, 'BE': 8, 'PE': 9, 'VIOL': 9, 'MA': 9, 'SV': 10, 'GY': 11, 'BR': 12, 'BK': 13 }
 
@@ -18,11 +17,20 @@ color_rank = { 'WE': 1, 'YL': 2, 'GD': 3, 'OE': 4, 'PINK': 5, 'RD': 6, 'GN': 7, 
 @st.cache_data
 def process_data(master_file, delivery_file, receiving_file, setup_file):
     try:
-        # アップロードされたファイル群を直接読み込む
-        master_df = pd.read_csv(master_file, skiprows=3, low_memory=False)
-        delivery_df = pd.read_csv(delivery_file, skiprows=3, low_memory=False)
-        receiving_df = pd.read_csv(receiving_file, skiprows=4, low_memory=False)
-        setup_speed_df = pd.read_csv(setup_file, low_memory=False)
+        # 拡張子を判定して読み込むヘルパー関数
+        def load_file(file_obj, skip_rows=0):
+            if file_obj.name.lower().endswith('.csv'):
+                return pd.read_csv(file_obj, skiprows=skip_rows, low_memory=False)
+            elif file_obj.name.lower().endswith(('.xlsx', '.xls')):
+                return pd.read_excel(file_obj, skiprows=skip_rows)
+            else:
+                raise ValueError(f"対応していないファイル形式です: {file_obj.name}")
+
+        # アップロードされたファイル群を読み込む
+        master_df = load_file(master_file, skip_rows=3)
+        delivery_df = load_file(delivery_file, skip_rows=3)
+        receiving_df = load_file(receiving_file, skip_rows=4)
+        setup_speed_df = load_file(setup_file, skip_rows=0)
 
         # カラム名の空白除去
         for df in [master_df, delivery_df, receiving_df, setup_speed_df]:
@@ -104,11 +112,12 @@ def process_data(master_file, delivery_file, receiving_file, setup_file):
 # --- フロントエンドUI ---
 with st.sidebar:
     st.header("📂 データアップロード")
-    st.caption("※アップロードされたデータは一時的なものであり、システムに保存されません。")
-    f_master = st.file_uploader("1. MasterCard (CSV)", type=['csv'])
-    f_delivery = st.file_uploader("2. Delivery (CSV)", type=['csv'])
-    f_recv = st.file_uploader("3. Receiving (CSV)", type=['csv'])
-    f_setup = st.file_uploader("4. Setup Speed (CSV)", type=['csv'])
+    st.caption("※CSV形式、またはExcel形式（.xlsx, .xls）に対応しています。")
+    # type に 'xlsx', 'xls' を追加
+    f_master = st.file_uploader("1. MasterCard", type=['csv', 'xlsx', 'xls'])
+    f_delivery = st.file_uploader("2. Delivery", type=['csv', 'xlsx', 'xls'])
+    f_recv = st.file_uploader("3. Receiving", type=['csv', 'xlsx', 'xls'])
+    f_setup = st.file_uploader("4. Setup Speed", type=['csv', 'xlsx', 'xls'])
 
 if f_master and f_delivery and f_recv and f_setup:
     if "schedule_data" not in st.session_state:
@@ -161,4 +170,4 @@ if f_master and f_delivery and f_recv and f_setup:
             type="primary"
         )
 else:
-    st.info("👈 左側のサイドバーから、本日の各種CSVファイル（4つ）をすべてアップロードしてください。")
+    st.info("👈 左側のサイドバーから、本日の各種データ（CSVまたはExcel）を4つすべてアップロードしてください。")
