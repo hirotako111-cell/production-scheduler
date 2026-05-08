@@ -44,10 +44,13 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
         if file_obj.name.lower().endswith('.csv'): return pd.read_csv(file_obj, skiprows=skip_rows, low_memory=False)
         else: return pd.read_excel(file_obj, skiprows=skip_rows)
 
-    # 【修正箇所】列名が空白や数字（float）でもエラーにならないよう str() で変換
+    # 全角/半角の「#」や空白の揺れを完全に吸収する検索関数
     def find_col(df, keywords):
         for col in df.columns:
-            if any(k in str(col).upper() for k in keywords): return str(col)
+            normalized_col = str(col).upper().replace('＃', '#').replace(' ', '')
+            for k in keywords:
+                if k.replace(' ', '') in normalized_col: 
+                    return str(col)
         return None
 
     # 各種ファイルの読み込み
@@ -55,22 +58,29 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
     delivery_df = load_file(delivery_file, skip_rows=3)
     setup_speed_df = load_file(setup_file, skip_rows=0)
     
-    # 【修正箇所】列名のストリップ処理時にも強制的に文字列(str)に変換
     for df in [master_df, delivery_df, setup_speed_df]: 
         df.columns = df.columns.astype(str).str.strip()
 
-    # MSC# への修正対応を含めた列名特定
-    mcs_col_delivery = find_col(delivery_df, ['MCS#', 'MSC#', 'M/CARD SEQ#'])
+    # Deliveryファイルの MCS# 列を特定（見つからなければD列：インデックス3を強制適用）
+    mcs_col_delivery = find_col(delivery_df, ['MCS#'])
     if not mcs_col_delivery:
-        st.error(f"Deliveryファイル内に 'MSC#' または 'MCS#' 列が見つかりません。列名を確認してください。")
-        st.stop()
+        if len(delivery_df.columns) > 3:
+            mcs_col_delivery = delivery_df.columns[3] # D列
+        else:
+            st.error(f"Deliveryファイルの列数が不足しています。現在の列: {list(delivery_df.columns)}")
+            st.stop()
+
+    # Masterファイルの MCS# 列特定
+    mcs_col_master = find_col(master_df, ['MCS#'])
+    if not mcs_col_master:
+        mcs_col_master = master_df.columns[3] if len(master_df.columns) > 3 else master_df.columns[0]
 
     # 材料受入データの読み込み
     recv_dict = {}
     if recv_file:
         recv_df = load_file(recv_file, skip_rows=4)
         recv_df.columns = recv_df.columns.astype(str).str.strip()
-        mcs_col_recv = find_col(recv_df, ['MCS#', 'MSC#', 'PART'])
+        mcs_col_recv = find_col(recv_df, ['MCS#', 'PART'])
         status_col_recv = find_col(recv_df, ['STATUS', 'RECV'])
         if mcs_col_recv and status_col_recv:
             recv_dict = recv_df.set_index(mcs_col_recv)[status_col_recv].to_dict()
@@ -84,7 +94,7 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
             'speed': float(row['生産速度（枚/時）']) if pd.notna(row['生産速度（枚/時）']) else 100.0
         }
 
-    mc_dict = master_df.drop_duplicates(subset=[find_col(master_df, ['MCS#', 'MSC#']) or 'MCS#']).set_index(find_col(master_df, ['MCS#', 'MSC#']) or 'MCS#').to_dict('index')
+    mc_dict = master_df.drop_duplicates(subset=[mcs_col_master]).set_index(mcs_col_master).to_dict('index')
 
     def get_routing(mcs):
         if mcs not in mc_dict: return None
@@ -98,7 +108,7 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
     if track_file:
         track_df = load_file(track_file, skip_rows=4)
         track_df.columns = track_df.columns.astype(str).str.strip()
-        mcs_col_track = find_col(track_df, ['MCS#', 'MSC#'])
+        mcs_col_track = find_col(track_df, ['MCS#'])
         for _, t_row in track_df.iterrows():
             mcs = str(t_row.get(mcs_col_track, '')).strip()
             if not mcs or mcs == 'nan': continue
@@ -107,7 +117,7 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
                 mach = get_routing(mcs)
                 if not mach: continue
                 jobs.append({
-                    '優先度': 'A (前日繰越)', '機械': mach, 'MSC#': mcs, 
+                    '優先度': 'A (前日繰越)', '機械': mach, 'MCS#': mcs, 
                     '出荷日': '繰越分', '数量': int(remaining), '材料': '入荷済'
                 })
 
@@ -141,7 +151,7 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
         else: rank = 'D (調整)'
 
         jobs.append({
-            '優先度': rank, '機械': mach, 'MSC#': mcs, 
+            '優先度': rank, '機械': mach, 'MCS#': mcs, 
             '出荷日': ddate.strftime('%Y-%m-%d') if ddate else '2099-12-31',
             '数量': int(order_qty), '材料': mat_status
         })
@@ -217,7 +227,7 @@ if f_master and f_delivery and f_setup:
     for _, row in edited_df.iterrows():
         m = row['機械']
         # 段取り時間の決定（同一アイテムなら0分、それ以外は25分想定）
-        setup = 0 if prev_mcs[m] == row['MSC#'] else 25
+        setup = 0 if prev_mcs[m] == row['MCS#'] else 25
         duration = setup + (row['数量'] / 100 * 60)
         c_start = current_times[m]
         c_end = add_working_time(c_start, duration)
@@ -237,9 +247,12 @@ if f_master and f_delivery and f_setup:
         
         final_recs.append(row)
         current_times[m] = add_working_time(c_end, 30)
-        prev_mcs[m] = row['MSC#']
+        prev_mcs[m] = row['MCS#']
 
-    st.dataframe(pd.DataFrame(final_recs)[['実行順', '優先度', '機械', 'MSC#', '数量', '材料', '開始', '終了', '状況']], use_container_width=True)
+    st.dataframe(pd.DataFrame(final_recs)[['実行順', '優先度', '機械', 'MCS#', '数量', '材料', '開始', '終了', '状況']], use_container_width=True)
+
+    csv = pd.DataFrame(final_recs).to_csv(index=False, encoding='utf-8-sig')
+    st.download_button("📥 確定したスケジュールをダウンロード", data=csv, file_name=f'plan_{target_date.strftime("%Y%m%d")}.csv', mime='text/csv', type="primary")
 
 else:
     st.info("👈 左側のサイドバーから必要なファイルをアップロードしてください。")
