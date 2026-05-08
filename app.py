@@ -10,18 +10,15 @@ st.title("🏭 生産計画調整ダッシュボード (社内工程専用)")
 
 # --- 時間計算ロジック（休憩除外） ---
 def add_working_time(start_dt, duration_mins):
-    # 安全装置1: durationが空や無限大の場合は0にする
     if pd.isna(duration_mins) or duration_mins == float('inf'):
         duration_mins = 0
         
-    # 安全装置2: 9999年などの異常値によるOverflowを防ぐ（2100年にキャップ）
     if start_dt.year > 2100:
         start_dt = start_dt.replace(year=2100)
         
     current_time = start_dt
     remaining = float(duration_mins)
     
-    # 安全装置3: 異常な長時間（無限ループ）を防止
     if remaining > 500000: remaining = 500000 
     
     while remaining > 0:
@@ -92,7 +89,6 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
             for _, r in recv_df.iterrows():
                 m_val = str(r[r_mcs]).strip()
                 try:
-                    # 9999年などのエラー値を回避
                     dt = pd.to_datetime(r[r_date], errors='coerce')
                     if pd.notna(dt) and dt.year < 2100:
                         recv_schedule[m_val] = dt
@@ -132,8 +128,8 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
                     if mach:
                         jobs.append({'優先度': 'A (繰越)', '機械': mach, 'MCS#': mcs, '出荷日': '繰越分', '数量': int(rem), '入荷予定': '入荷済', 'recv_dt': None})
 
-    # 2. 新規Delivery
-    qty_col = find_col(delivery_df, ['ORDER', 'QTY'], default_idx=14)
+    # 2. 新規Delivery (P列 = Index 15) を指定
+    qty_col = find_col(delivery_df, ['ORDER'], default_idx=15)
     due_col = find_col(delivery_df, ['DUE DATE', 'DELIVERY'])
     
     for _, d_row in delivery_df.dropna(subset=[mcs_col_d]).iterrows():
@@ -184,7 +180,7 @@ if f_master and f_delivery and f_setup:
     if show_debug:
         st.info("💡 デバッグ情報：システムが認識している列名")
         st.write("Master:", pd.read_csv(f_master, skiprows=3, nrows=0).columns.tolist()[:10] if f_master.name.endswith('.csv') else pd.read_excel(f_master, skiprows=3, nrows=0).columns.tolist()[:10])
-        st.write("Delivery:", pd.read_csv(f_delivery, skiprows=3, nrows=0).columns.tolist()[:10] if f_delivery.name.endswith('.csv') else pd.read_excel(f_delivery, skiprows=3, nrows=0).columns.tolist()[:10])
+        st.write("Delivery:", pd.read_csv(f_delivery, skiprows=3, nrows=0).columns.tolist()[:20] if f_delivery.name.endswith('.csv') else pd.read_excel(f_delivery, skiprows=3, nrows=0).columns.tolist()[:20])
 
     if raw_df.empty:
         st.warning("⚠️ ジョブが見つかりませんでした。")
@@ -227,7 +223,6 @@ if f_master and f_delivery and f_setup:
         orig = raw_df[raw_df['MCS#'] == row['MCS#']].iloc[0]
         rdt = orig['recv_dt']
         
-        # 異常な日時（9999年など）をスキップして開始時間を決定
         safe_rdt = rdt if pd.notna(rdt) and rdt.year < 2100 else None
         start = max(current_times[m], safe_rdt.replace(hour=8, minute=0) if safe_rdt else current_times[m])
         
