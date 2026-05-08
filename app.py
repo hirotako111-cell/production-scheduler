@@ -43,12 +43,10 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
             return pd.read_excel(file_obj, skiprows=skip_rows)
 
     def find_col(df, keywords, default_idx=None):
-        # 1. 名前で検索（正規化して比較）
         for i, col in enumerate(df.columns):
             norm = str(col).upper().replace(' ', '').replace('＃', '#')
             for k in keywords:
                 if k in norm: return col
-        # 2. 名前で見つからず、デフォルト位置が指定されていればそれを使う
         if default_idx is not None and len(df.columns) > default_idx:
             return df.columns[default_idx]
         return None
@@ -58,16 +56,14 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
     delivery_df = load_file(delivery_file, skip_rows=3)
     setup_speed_df = load_file(setup_file, skip_rows=0)
     
-    # 全ての列名を文字列化してクリーンアップ
     for df in [master_df, delivery_df, setup_speed_df]:
         df.columns = df.columns.astype(str).str.strip()
 
-    # MCS# 列の特定 (MasterCardはF列=Index 5, DeliveryはD列=Index 3 を優先)
     mcs_col_m = find_col(master_df, ['MCS#', 'MSC#'], default_idx=5)
     mcs_col_d = find_col(delivery_df, ['MCS#', 'MSC#'], default_idx=3)
 
     if not mcs_col_m or not mcs_col_d:
-        st.error(f"MCS#列が特定できませんでした。MasterCard列数: {len(master_df.columns)}, Delivery列数: {len(delivery_df.columns)}")
+        st.error(f"MCS#列が特定できませんでした。")
         st.stop()
 
     # 受入(Receiving)データの構築
@@ -86,7 +82,6 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
                 except:
                     recv_schedule[m_val] = datetime(2099, 12, 31)
 
-    # MasterCard辞書の作成
     mc_dict = master_df.drop_duplicates(subset=[mcs_col_m]).set_index(mcs_col_m).to_dict('index')
 
     def get_internal_routing(mcs):
@@ -107,11 +102,12 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
         if t_mcs:
             for _, t_row in track_df.iterrows():
                 mcs = str(t_row.get(t_mcs, '')).strip()
-                try:
-                    plan = float(t_row.get('PLAN OUT', 0))
-                    good = float(t_row.get('GOOD', 0))
-                    rem = plan - good
-                except: rem = 0
+                # 修正ポイント: 空欄や文字を安全に数値変換
+                plan = pd.to_numeric(t_row.get('PLAN OUT', 0), errors='coerce')
+                good = pd.to_numeric(t_row.get('GOOD', 0), errors='coerce')
+                plan = plan if pd.notna(plan) else 0
+                good = good if pd.notna(good) else 0
+                rem = plan - good
                 
                 if rem > 0:
                     mach = get_internal_routing(mcs)
@@ -120,21 +116,29 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
 
     # 2. 新規Delivery
     qty_col = find_col(delivery_df, ['ORDER', 'QTY'], default_idx=14)
+    due_col = find_col(delivery_df, ['DUE DATE', 'DELIVERY'])
+    
     for _, d_row in delivery_df.dropna(subset=[mcs_col_d]).iterrows():
         mcs = str(d_row[mcs_col_d]).strip()
-        try: qty = float(d_row.get(qty_col, 0))
-        except: qty = 0
-        if qty <= 0: continue
+        
+        # 修正ポイント: 数量を安全に取得（空欄やNaNを弾く）
+        qty_raw = d_row.get(qty_col, 0)
+        qty = pd.to_numeric(qty_raw, errors='coerce')
+        if pd.isna(qty) or qty <= 0:
+            continue
         
         mach = get_internal_routing(mcs)
         if not mach: continue
         
         recv_dt = recv_schedule.get(mcs, None)
-        recv_str = recv_dt.strftime('%m/%d') if recv_dt and recv_dt < datetime(2099,1,1) else "確認中"
+        recv_str = recv_dt.strftime('%m/%d') if pd.notna(recv_dt) and recv_dt < datetime(2099,1,1) else "確認中"
+        
+        due_val = str(d_row.get(due_col, '-')) if due_col else '-'
+        if due_val == 'nan' or pd.isna(due_val): due_val = '-'
         
         jobs.append({
             '優先度': 'B (通常)', '機械': mach, 'MCS#': mcs, 
-            '出荷日': str(d_row.get('DUE DATE', '-')), '数量': int(qty), '入荷予定': recv_str, 'recv_dt': recv_dt
+            '出荷日': due_val, '数量': int(qty), '入荷予定': recv_str, 'recv_dt': recv_dt
         })
 
     if not jobs: return pd.DataFrame()
@@ -156,21 +160,20 @@ with st.sidebar:
     f_recv = st.file_uploader("5. Receiving Schedule", type=['csv', 'xlsx'])
     
     st.markdown("---")
-    show_debug = st.checkbox("🔍 デバッグ用：列名の確認を表示", value=False)
+    show_debug = st.checkbox("🔍 デバッグ情報を表示", value=False)
 
 if f_master and f_delivery and f_setup:
     raw_df = process_data(f_master, f_delivery, f_setup, f_track, f_recv, target_date)
     
     if show_debug:
-        st.info("💡 デバッグ情報：システムが認識している各ファイルの先頭5列名")
-        st.write("MasterCard:", pd.read_csv(f_master, skiprows=3, nrows=0).columns.tolist()[:10] if f_master.name.endswith('.csv') else pd.read_excel(f_master, skiprows=3, nrows=0).columns.tolist()[:10])
+        st.info("💡 デバッグ情報：システムが認識している列名")
+        st.write("Master:", pd.read_csv(f_master, skiprows=3, nrows=0).columns.tolist()[:10] if f_master.name.endswith('.csv') else pd.read_excel(f_master, skiprows=3, nrows=0).columns.tolist()[:10])
         st.write("Delivery:", pd.read_csv(f_delivery, skiprows=3, nrows=0).columns.tolist()[:10] if f_delivery.name.endswith('.csv') else pd.read_excel(f_delivery, skiprows=3, nrows=0).columns.tolist()[:10])
 
     if raw_df.empty:
-        st.warning("⚠️ ジョブが見つかりませんでした。MasterCardのMCS#とDeliveryのMCS#が正しく紐付いているか、または社内工程(P1, P2等)がMasterCardに定義されているか確認してください。")
+        st.warning("⚠️ ジョブが見つかりませんでした。データが空か、対象となる社内工程が存在しません。")
         st.stop()
 
-    # 以降、グラフ表示・調整ボード・再計算ロジック（前回の完全版と同様）
     machine_list = sorted(raw_df['機械'].dropna().unique().tolist())
     st.markdown("### 📊 全機械 負荷状況")
     workload_data = [{'機械': m, '稼働予定(分)': round(len(raw_df[raw_df['機械']==m])*25 + (raw_df[raw_df['機械']==m]['数量'].sum()/100*60), 1)} for m in machine_list]
