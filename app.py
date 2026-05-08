@@ -214,8 +214,22 @@ if f_master and f_delivery and f_setup:
         c_end = add_working_time(c_start, duration)
         
         row['開始'], row['終了'] = c_start.strftime("%H:%M"), c_end.strftime("%H:%M")
-        row['状況'] = "🚨 遅延" if row['出荷日'] != '繰越分' and c_end > datetime.strptime(row['出荷日'], "%Y-%m-%d").replace(hour=23) if '-' in row['出荷日'] else False else "✅ OK"
-        if row['材料'] == "未入荷": row['状況'] = "❌ 材料待ち"
+        
+        # === 修正箇所：エラーが起きていた状況判定ロジックをきれいに整理 ===
+        status = "✅ OK"
+        
+        # 1. 納期遅延チェック（繰越分や日付未定のものは除外）
+        if row['出荷日'] not in ['繰越分', '2099-12-31'] and '-' in row['出荷日']:
+            due_dt = datetime.strptime(row['出荷日'], "%Y-%m-%d").replace(hour=23, minute=59)
+            if c_end > due_dt:
+                status = "🚨 遅延"
+                
+        # 2. 材料ステータスの上書き（材料がなければそもそも生産できないため）
+        if row['材料'] == "未入荷": 
+            status = "❌ 材料待ち"
+            
+        row['状況'] = status
+        # =========================================================
         
         final_recs.append(row)
         current_times[m] = add_working_time(c_end, 30)
@@ -224,4 +238,4 @@ if f_master and f_delivery and f_setup:
     st.dataframe(pd.DataFrame(final_recs)[['実行順', '優先度', '機械', 'MCS#', '数量', '材料', '開始', '終了', '状況']], use_container_width=True)
 
 else:
-    st.info("👈 左側のサイドバーから5つのファイルをアップロードしてください。")
+    st.info("👈 左側のサイドバーから必要なファイルをアップロードしてください。")
