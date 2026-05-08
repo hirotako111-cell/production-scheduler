@@ -44,9 +44,10 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
         if file_obj.name.lower().endswith('.csv'): return pd.read_csv(file_obj, skiprows=skip_rows, low_memory=False)
         else: return pd.read_excel(file_obj, skiprows=skip_rows)
 
+    # 【修正箇所】列名が空白や数字（float）でもエラーにならないよう str() で変換
     def find_col(df, keywords):
         for col in df.columns:
-            if any(k in col.upper() for k in keywords): return col
+            if any(k in str(col).upper() for k in keywords): return str(col)
         return None
 
     # 各種ファイルの読み込み
@@ -54,19 +55,21 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
     delivery_df = load_file(delivery_file, skip_rows=3)
     setup_speed_df = load_file(setup_file, skip_rows=0)
     
-    for df in [master_df, delivery_df, setup_speed_df]: df.columns = df.columns.str.strip()
+    # 【修正箇所】列名のストリップ処理時にも強制的に文字列(str)に変換
+    for df in [master_df, delivery_df, setup_speed_df]: 
+        df.columns = df.columns.astype(str).str.strip()
 
     # MSC# への修正対応を含めた列名特定
     mcs_col_delivery = find_col(delivery_df, ['MCS#', 'MSC#', 'M/CARD SEQ#'])
     if not mcs_col_delivery:
-        st.error(f"Deliveryファイル内に 'MCS#' または 'MSC#' 列が見つかりません。列名を確認してください。")
+        st.error(f"Deliveryファイル内に 'MSC#' または 'MCS#' 列が見つかりません。列名を確認してください。")
         st.stop()
 
     # 材料受入データの読み込み
     recv_dict = {}
     if recv_file:
         recv_df = load_file(recv_file, skip_rows=4)
-        recv_df.columns = recv_df.columns.str.strip()
+        recv_df.columns = recv_df.columns.astype(str).str.strip()
         mcs_col_recv = find_col(recv_df, ['MCS#', 'MSC#', 'PART'])
         status_col_recv = find_col(recv_df, ['STATUS', 'RECV'])
         if mcs_col_recv and status_col_recv:
@@ -81,7 +84,7 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
             'speed': float(row['生産速度（枚/時）']) if pd.notna(row['生産速度（枚/時）']) else 100.0
         }
 
-    mc_dict = master_df.drop_duplicates(subset=['MCS#']).set_index('MCS#').to_dict('index')
+    mc_dict = master_df.drop_duplicates(subset=[find_col(master_df, ['MCS#', 'MSC#']) or 'MCS#']).set_index(find_col(master_df, ['MCS#', 'MSC#']) or 'MCS#').to_dict('index')
 
     def get_routing(mcs):
         if mcs not in mc_dict: return None
@@ -94,7 +97,7 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
     # 1. 実績ファイル(Floor Track)から「未完了分」を抽出
     if track_file:
         track_df = load_file(track_file, skip_rows=4)
-        track_df.columns = track_df.columns.str.strip()
+        track_df.columns = track_df.columns.astype(str).str.strip()
         mcs_col_track = find_col(track_df, ['MCS#', 'MSC#'])
         for _, t_row in track_df.iterrows():
             mcs = str(t_row.get(mcs_col_track, '')).strip()
@@ -104,20 +107,26 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
                 mach = get_routing(mcs)
                 if not mach: continue
                 jobs.append({
-                    '優先度': 'A (前日繰越)', '機械': mach, 'MCS#': mcs, 
+                    '優先度': 'A (前日繰越)', '機械': mach, 'MSC#': mcs, 
                     '出荷日': '繰越分', '数量': int(remaining), '材料': '入荷済'
                 })
 
     # 2. 新規Deliveryデータの抽出
     def parse_date(d_str):
         if pd.isna(d_str): return None
-        try: return datetime.strptime(f"{d_str.split(' ')[0]}/{target_date.year}", "%d/%m/%Y")
+        try: return datetime.strptime(f"{str(d_str).split(' ')[0]}/{target_date.year}", "%d/%m/%Y")
         except: return None
-    delivery_df['Delivery_Date'] = delivery_df['DUE DATE'].apply(parse_date) if 'DUE DATE' in delivery_df.columns else None
+    
+    date_col = find_col(delivery_df, ['DUE DATE', 'DELIVERY'])
+    if date_col:
+        delivery_df['Delivery_Date'] = delivery_df[date_col].apply(parse_date)
+    else:
+        delivery_df['Delivery_Date'] = None
 
     for _, d_row in delivery_df.dropna(subset=[mcs_col_delivery]).iterrows():
         mcs = str(d_row[mcs_col_delivery]).strip()
-        order_qty = float(d_row['ORDER']) if 'ORDER' in d_row and pd.notna(d_row['ORDER']) else 0
+        order_col = find_col(delivery_df, ['ORDER', 'QTY'])
+        order_qty = float(d_row[order_col]) if order_col and pd.notna(d_row[order_col]) else 0
         if order_qty <= 0: continue
         mach = get_routing(mcs)
         if not mach: continue
@@ -132,7 +141,7 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
         else: rank = 'D (調整)'
 
         jobs.append({
-            '優先度': rank, '機械': mach, 'MCS#': mcs, 
+            '優先度': rank, '機械': mach, 'MSC#': mcs, 
             '出荷日': ddate.strftime('%Y-%m-%d') if ddate else '2099-12-31',
             '数量': int(order_qty), '材料': mat_status
         })
@@ -208,34 +217,29 @@ if f_master and f_delivery and f_setup:
     for _, row in edited_df.iterrows():
         m = row['機械']
         # 段取り時間の決定（同一アイテムなら0分、それ以外は25分想定）
-        setup = 0 if prev_mcs[m] == row['MCS#'] else 25
+        setup = 0 if prev_mcs[m] == row['MSC#'] else 25
         duration = setup + (row['数量'] / 100 * 60)
         c_start = current_times[m]
         c_end = add_working_time(c_start, duration)
         
         row['開始'], row['終了'] = c_start.strftime("%H:%M"), c_end.strftime("%H:%M")
         
-        # === 修正箇所：エラーが起きていた状況判定ロジックをきれいに整理 ===
         status = "✅ OK"
-        
-        # 1. 納期遅延チェック（繰越分や日付未定のものは除外）
         if row['出荷日'] not in ['繰越分', '2099-12-31'] and '-' in row['出荷日']:
             due_dt = datetime.strptime(row['出荷日'], "%Y-%m-%d").replace(hour=23, minute=59)
             if c_end > due_dt:
                 status = "🚨 遅延"
                 
-        # 2. 材料ステータスの上書き（材料がなければそもそも生産できないため）
         if row['材料'] == "未入荷": 
             status = "❌ 材料待ち"
             
         row['状況'] = status
-        # =========================================================
         
         final_recs.append(row)
         current_times[m] = add_working_time(c_end, 30)
-        prev_mcs[m] = row['MCS#']
+        prev_mcs[m] = row['MSC#']
 
-    st.dataframe(pd.DataFrame(final_recs)[['実行順', '優先度', '機械', 'MCS#', '数量', '材料', '開始', '終了', '状況']], use_container_width=True)
+    st.dataframe(pd.DataFrame(final_recs)[['実行順', '優先度', '機械', 'MSC#', '数量', '材料', '開始', '終了', '状況']], use_container_width=True)
 
 else:
     st.info("👈 左側のサイドバーから必要なファイルをアップロードしてください。")
