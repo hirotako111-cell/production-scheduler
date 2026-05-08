@@ -10,9 +10,24 @@ st.title("🏭 生産計画調整ダッシュボード (社内工程専用)")
 
 # --- 時間計算ロジック（休憩除外） ---
 def add_working_time(start_dt, duration_mins):
+    # 安全装置1: durationが空や無限大の場合は0にする
+    if pd.isna(duration_mins) or duration_mins == float('inf'):
+        duration_mins = 0
+        
+    # 安全装置2: 9999年などの異常値によるOverflowを防ぐ（2100年にキャップ）
+    if start_dt.year > 2100:
+        start_dt = start_dt.replace(year=2100)
+        
     current_time = start_dt
-    remaining = duration_mins
+    remaining = float(duration_mins)
+    
+    # 安全装置3: 異常な長時間（無限ループ）を防止
+    if remaining > 500000: remaining = 500000 
+    
     while remaining > 0:
+        if current_time.year > 2100:
+            break
+            
         hour, minute = current_time.hour, current_time.minute
         if hour == 12: current_time = current_time.replace(hour=13, minute=0)
         elif hour == 17 and minute < 15: current_time = current_time.replace(minute=15)
@@ -77,10 +92,14 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
             for _, r in recv_df.iterrows():
                 m_val = str(r[r_mcs]).strip()
                 try:
-                    dt = pd.to_datetime(r[r_date])
-                    recv_schedule[m_val] = dt
+                    # 9999年などのエラー値を回避
+                    dt = pd.to_datetime(r[r_date], errors='coerce')
+                    if pd.notna(dt) and dt.year < 2100:
+                        recv_schedule[m_val] = dt
+                    else:
+                        recv_schedule[m_val] = None
                 except:
-                    recv_schedule[m_val] = datetime(2099, 12, 31)
+                    recv_schedule[m_val] = None
 
     mc_dict = master_df.drop_duplicates(subset=[mcs_col_m]).set_index(mcs_col_m).to_dict('index')
 
@@ -102,7 +121,6 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
         if t_mcs:
             for _, t_row in track_df.iterrows():
                 mcs = str(t_row.get(t_mcs, '')).strip()
-                # 修正ポイント: 空欄や文字を安全に数値変換
                 plan = pd.to_numeric(t_row.get('PLAN OUT', 0), errors='coerce')
                 good = pd.to_numeric(t_row.get('GOOD', 0), errors='coerce')
                 plan = plan if pd.notna(plan) else 0
@@ -120,8 +138,6 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
     
     for _, d_row in delivery_df.dropna(subset=[mcs_col_d]).iterrows():
         mcs = str(d_row[mcs_col_d]).strip()
-        
-        # 修正ポイント: 数量を安全に取得（空欄やNaNを弾く）
         qty_raw = d_row.get(qty_col, 0)
         qty = pd.to_numeric(qty_raw, errors='coerce')
         if pd.isna(qty) or qty <= 0:
@@ -131,7 +147,7 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
         if not mach: continue
         
         recv_dt = recv_schedule.get(mcs, None)
-        recv_str = recv_dt.strftime('%m/%d') if pd.notna(recv_dt) and recv_dt < datetime(2099,1,1) else "確認中"
+        recv_str = recv_dt.strftime('%m/%d') if pd.notna(recv_dt) and recv_dt.year < 2100 else "確認中"
         
         due_val = str(d_row.get(due_col, '-')) if due_col else '-'
         if due_val == 'nan' or pd.isna(due_val): due_val = '-'
@@ -171,13 +187,26 @@ if f_master and f_delivery and f_setup:
         st.write("Delivery:", pd.read_csv(f_delivery, skiprows=3, nrows=0).columns.tolist()[:10] if f_delivery.name.endswith('.csv') else pd.read_excel(f_delivery, skiprows=3, nrows=0).columns.tolist()[:10])
 
     if raw_df.empty:
-        st.warning("⚠️ ジョブが見つかりませんでした。データが空か、対象となる社内工程が存在しません。")
+        st.warning("⚠️ ジョブが見つかりませんでした。")
         st.stop()
 
     machine_list = sorted(raw_df['機械'].dropna().unique().tolist())
-    st.markdown("### 📊 全機械 負荷状況")
-    workload_data = [{'機械': m, '稼働予定(分)': round(len(raw_df[raw_df['機械']==m])*25 + (raw_df[raw_df['機械']==m]['数量'].sum()/100*60), 1)} for m in machine_list]
-    st.altair_chart(alt.Chart(pd.DataFrame(workload_data)).mark_bar().encode(x='稼働予定(分):Q', y=alt.Y('機械:N', sort='-x'), color=alt.condition(alt.datum['稼働予定(分)'] > 480, alt.value('#e74c3c'), alt.value('#3498db'))).properties(height=200), use_container_width=True)
+    
+    # グラフを時間単位（Hours）に変更
+    st.markdown("### 📊 全機械 負荷状況 (単位: 時間)")
+    workload_data = []
+    for m in machine_list:
+        m_df = raw_df[raw_df['機械'] == m]
+        total_mins = len(m_df) * 25 + (m_df['数量'].sum() / 100 * 60)
+        total_hours = total_mins / 60.0  # 分を時間に変換
+        workload_data.append({'機械': m, '稼働予定(時間)': round(total_hours, 1)})
+        
+    chart = alt.Chart(pd.DataFrame(workload_data)).mark_bar().encode(
+        x='稼働予定(時間):Q', 
+        y=alt.Y('機械:N', sort='-x'), 
+        color=alt.condition(alt.datum['稼働予定(時間)'] > 8, alt.value('#e74c3c'), alt.value('#3498db')) # 8時間を超えると赤色
+    ).properties(height=200)
+    st.altair_chart(chart, use_container_width=True)
 
     st.markdown("---")
     st.markdown("### ⏱ 機械ごとの開始時刻設定")
@@ -197,12 +226,19 @@ if f_master and f_delivery and f_setup:
         m = row['機械']
         orig = raw_df[raw_df['MCS#'] == row['MCS#']].iloc[0]
         rdt = orig['recv_dt']
-        start = max(current_times[m], rdt.replace(hour=8, minute=0) if pd.notna(rdt) else current_times[m])
+        
+        # 異常な日時（9999年など）をスキップして開始時間を決定
+        safe_rdt = rdt if pd.notna(rdt) and rdt.year < 2100 else None
+        start = max(current_times[m], safe_rdt.replace(hour=8, minute=0) if safe_rdt else current_times[m])
+        
         duration = 25 + (row['数量'] / 100 * 60)
         end = add_working_time(start, duration)
+        
         row['開始'], row['終了'] = start.strftime("%H:%M"), end.strftime("%H:%M")
         row['状況'] = "✅ OK"
-        if pd.notna(rdt) and rdt > datetime.combine(target_date, datetime.min.time()): row['状況'] = f"⏳ {row['入荷予定']} 入荷待ち"
+        if safe_rdt and safe_rdt > datetime.combine(target_date, datetime.min.time()): 
+            row['状況'] = f"⏳ {row['入荷予定']} 入荷待ち"
+            
         final_recs.append(row)
         current_times[m] = add_working_time(end, 30)
 
