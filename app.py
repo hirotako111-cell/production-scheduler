@@ -3,53 +3,43 @@ import pandas as pd
 import numpy as np
 import re
 from datetime import datetime, timedelta
+import altair as alt
 
 # --- ページ設定 ---
-st.set_page_config(page_title="生産計画カンバン・ダッシュボード", layout="wide")
-st.title("🏭 生産計画カンバン・ダッシュボード")
+st.set_page_config(page_title="生産計画調整ダッシュボード", layout="wide")
+st.title("🏭 生産計画調整ダッシュボード")
 
 # --- 初期設定 ---
-CURRENT_SIM_DATE = datetime(2026, 4, 2)
 color_rank = { 'WE': 1, 'YL': 2, 'GD': 3, 'OE': 4, 'PINK': 5, 'RD': 6, 'GN': 7, 'BE': 8, 'PE': 9, 'VIOL': 9, 'MA': 9, 'SV': 10, 'GY': 11, 'BR': 12, 'BK': 13 }
 
-# --- 時間計算ロジック ---
+# --- 時間計算ロジック（休憩除外） ---
 def add_working_time(start_dt, duration_mins):
-    # 簡易稼働時間カレンダー（08:00-12:00, 13:00-17:00, 17:15-21:00）
     current_time = start_dt
     remaining = duration_mins
-    
     while remaining > 0:
-        hour = current_time.hour
-        minute = current_time.minute
-        
-        # 休憩時間のスキップ
-        if hour == 12:
-            current_time = current_time.replace(hour=13, minute=0)
-        elif hour == 17 and minute < 15:
-            current_time = current_time.replace(minute=15)
+        hour, minute = current_time.hour, current_time.minute
+        if hour == 12: current_time = current_time.replace(hour=13, minute=0)
+        elif hour == 17 and minute < 15: current_time = current_time.replace(minute=15)
         elif hour >= 21:
             current_time = (current_time + timedelta(days=1)).replace(hour=8, minute=0)
             continue
             
-        # 次の休憩までの時間を計算
         if hour < 12: next_break = current_time.replace(hour=12, minute=0)
         elif hour < 17: next_break = current_time.replace(hour=17, minute=0)
         else: next_break = current_time.replace(hour=21, minute=0)
         
         available_mins = (next_break - current_time).total_seconds() / 60
-        
         if remaining <= available_mins:
             current_time += timedelta(minutes=remaining)
             remaining = 0
         else:
             current_time = next_break
             remaining -= available_mins
-            
     return current_time
 
 # --- データ処理エンジン ---
 @st.cache_data
-def process_data(master_file, delivery_file, receiving_file, setup_file):
+def process_data(master_file, delivery_file, setup_file, track_file, target_date):
     def load_file(file_obj, skip_rows=0):
         if file_obj.name.lower().endswith('.csv'): return pd.read_csv(file_obj, skiprows=skip_rows, low_memory=False)
         else: return pd.read_excel(file_obj, skiprows=skip_rows)
@@ -69,178 +59,184 @@ def process_data(master_file, delivery_file, receiving_file, setup_file):
             'speed': float(row['生産速度（枚/時）']) if pd.notna(row['生産速度（枚/時）']) else 100.0
         }
 
-    def get_color_score(row):
-        score = 99
-        for i in range(1, 8):
-            col = f'COLOR {i}'
-            if col in row and pd.notna(row[col]):
-                match = re.search(r'([A-Za-z]+)$', str(row[col]).strip())
-                if match and match.group(1).upper() in color_rank:
-                    score = min(score, color_rank[match.group(1).upper()])
-        return score
+    mc_dict = master_df.drop_duplicates(subset=['MCS#']).set_index('MCS#').to_dict('index')
 
-    master_df_unique = master_df.drop_duplicates(subset=['MCS#']).copy()
-    master_df_unique['Color_Score'] = master_df_unique.apply(get_color_score, axis=1)
-    master_df_unique['Is_DieCut'] = master_df_unique['PD'].apply(lambda x: 1 if isinstance(x, str) and ('DC' in x or 'D/C' in x) else 0)
-    mc_dict = master_df_unique.set_index('MCS#').to_dict('index')
-
-    def parse_date(d_str):
-        if pd.isna(d_str): return None
-        try: return datetime.strptime(f"{d_str.split(' ')[0]}/2026", "%d/%m/%Y")
-        except: return None
-    delivery_df['Delivery_Date'] = delivery_df['DUE DATE'].apply(parse_date) if 'DUE DATE' in delivery_df.columns else None
-
-    jobs = []
-    for _, d_row in delivery_df.dropna(subset=['MCS#']).iterrows():
-        mcs = d_row['MCS#']
-        if mcs not in mc_dict: continue
-        order_qty = float(d_row['ORDER']) if 'ORDER' in d_row and pd.notna(d_row['ORDER']) else 0
-        if order_qty <= 0: continue
-        
+    def get_routing(mcs):
+        if mcs not in mc_dict: return None
         mc_info = mc_dict[mcs]
         routing = [str(mc_info[f'MSP{i}']).strip() for i in range(1, 13) if f'MSP{i}' in mc_info and pd.notna(mc_info[f'MSP{i}'])]
         routing = [m for m in routing if m != 'CORR' and m != '']
-        if not routing: continue
+        return routing[0] if routing else None
 
-        slack = (d_row['Delivery_Date'] - CURRENT_SIM_DATE).days if d_row['Delivery_Date'] else 99
-        if slack <= 1: rank = 'A(必達)'
-        elif slack <= 3: rank = 'B(推奨)'
-        else: rank = 'C(調整)'
-
-        # 初期パラメータの取得
-        mach = routing[0]
+    def get_setup_speed(mach, mcs):
+        if mcs not in mc_dict: return 10.0, 100.0
+        is_diecut = 1 if 'DC' in str(mc_dict[mcs].get('PD', '')) else 0
         params = machine_params.get(mach, {})
         setup_time, speed = 10.0, 100.0
-        if mach.startswith('P') and mc_info['Is_DieCut'] == 1 and '木型あり' in params:
+        if mach.startswith('P') and is_diecut == 1 and '木型あり' in params:
             setup_time, speed = params['木型あり']['setup'], params['木型あり']['speed']
+        return setup_time, speed
 
+    jobs = []
+    
+    # 1. 実績ファイル(Floor Track)から「未完了分（キャリーオーバー）」を抽出
+    if track_file is not None:
+        track_df = load_file(track_file, skip_rows=4)
+        track_df.columns = track_df.columns.str.strip()
+        for _, t_row in track_df.iterrows():
+            mcs = str(t_row.get('MCS#', '')).strip()
+            if not mcs or mcs == 'nan': continue
+            
+            plan_out = float(t_row.get('PLAN OUT', 0)) if pd.notna(t_row.get('PLAN OUT')) else 0
+            good = float(t_row.get('GOOD', 0)) if pd.notna(t_row.get('GOOD')) else 0
+            remaining = int(plan_out - good)
+            
+            if remaining > 0:
+                mach = get_routing(mcs)
+                if not mach: continue
+                setup_time, speed = get_setup_speed(mach, mcs)
+                jobs.append({
+                    '優先度': 'A (前日繰越)', '機械': mach, 'MCS#': mcs, 
+                    '出荷日': '繰越分', '数量': remaining, '段取り(分)': setup_time, '基準速度(枚/時)': speed
+                })
+
+    # 2. 新規Deliveryデータの抽出
+    def parse_date(d_str):
+        if pd.isna(d_str): return None
+        try: return datetime.strptime(f"{d_str.split(' ')[0]}/{target_date.year}", "%d/%m/%Y")
+        except: return None
+    delivery_df['Delivery_Date'] = delivery_df['DUE DATE'].apply(parse_date) if 'DUE DATE' in delivery_df.columns else None
+
+    for _, d_row in delivery_df.dropna(subset=['MCS#']).iterrows():
+        mcs = str(d_row['MCS#']).strip()
+        order_qty = float(d_row['ORDER']) if 'ORDER' in d_row and pd.notna(d_row['ORDER']) else 0
+        if order_qty <= 0: continue
+        
+        mach = get_routing(mcs)
+        if not mach: continue
+        
+        ddate = d_row['Delivery_Date']
+        slack = (ddate - target_date).days if ddate else 99
+        if slack <= 1: rank = 'B (本日/翌日必達)'
+        elif slack <= 3: rank = 'C (推奨)'
+        else: rank = 'D (調整)'
+
+        setup_time, speed = get_setup_speed(mach, mcs)
         jobs.append({
-            '優先度': rank,
-            '機械': mach,
-            'MCS#': mcs,
-            '出荷日': d_row['Delivery_Date'].strftime('%Y-%m-%d') if d_row['Delivery_Date'] else '2099-12-31',
-            '数量': int(order_qty),
-            '段取り(分)': setup_time,
-            '基準速度(枚/時)': speed,
-            'エラー状態': '正常'
+            '優先度': rank, '機械': mach, 'MCS#': mcs, 
+            '出荷日': ddate.strftime('%Y-%m-%d') if ddate else '2099-12-31',
+            '数量': int(order_qty), '段取り(分)': setup_time, '基準速度(枚/時)': speed
         })
 
     df_jobs = pd.DataFrame(jobs)
-    df_jobs.sort_values(by=['優先度'], inplace=True)
-    df_jobs.insert(0, '実行順', range(1, len(df_jobs) + 1))
-    return df_jobs, machine_params
+    if not df_jobs.empty:
+        df_jobs.sort_values(by=['優先度'], inplace=True)
+        df_jobs.insert(0, '実行順', range(1, len(df_jobs) + 1))
+    return df_jobs
 
 # --- フロントエンドUI ---
 with st.sidebar:
+    st.header("⚙️ 計画シミュレーション設定")
+    target_date = st.date_input("📅 計画を作成する日付", datetime(2026, 4, 2))
+    
+    st.markdown("---")
     st.header("📂 データアップロード")
     f_master = st.file_uploader("1. MasterCard", type=['csv', 'xlsx'])
     f_delivery = st.file_uploader("2. Delivery", type=['csv', 'xlsx'])
-    f_recv = st.file_uploader("3. Receiving", type=['csv', 'xlsx'])
-    f_setup = st.file_uploader("4. Setup Speed", type=['csv', 'xlsx'])
+    f_setup = st.file_uploader("3. Setup Speed", type=['csv', 'xlsx'])
+    st.caption("👇 以下のファイルをアップロードすると、未完了分が自動で最優先として組み込まれます。")
+    f_track = st.file_uploader("4. Floor Track Status (実績)", type=['csv', 'xlsx'])
+
+if f_master and f_delivery and f_setup:
+    # データ処理
+    raw_df = process_data(f_master, f_delivery, f_setup, f_track, datetime.combine(target_date, datetime.min.time()))
+    if raw_df.empty:
+        st.warning("計画対象のジョブが見つかりませんでした。")
+        st.stop()
+
+    machine_list = sorted(raw_df['機械'].unique().tolist())
+
+    # --- 1. 全機械の作業量比較グラフ ---
+    st.markdown("### 📊 本日の全機械 負荷状況 (予定総稼働時間)")
+    workload_data = []
+    for m in machine_list:
+        m_df = raw_df[raw_df['機械'] == m]
+        total_mins = m_df['段取り(分)'].sum() + (m_df['数量'] / m_df['基準速度(枚/時)'] * 60).sum()
+        workload_data.append({'機械': m, '総稼働予定(分)': round(total_mins, 1)})
+    
+    wl_df = pd.DataFrame(workload_data)
+    chart = alt.Chart(wl_df).mark_bar().encode(
+        x='総稼働予定(分):Q',
+        y=alt.Y('機械:N', sort='-x'),
+        color=alt.condition(alt.datum['総稼働予定(分)'] > 480, alt.value('#e74c3c'), alt.value('#3498db')),
+        tooltip=['機械', '総稼働予定(分)']
+    ).properties(height=200)
+    st.altair_chart(chart, use_container_width=True)
+
+    # --- 2. 稼働スタート時間の手修正設定 ---
+    st.markdown("### ⏱ 機械ごとの稼働開始時間設定")
+    st.caption("担当者の掛け持ち状況等に合わせて、各機械の最初のスタート時間を修正してください。")
+    cols = st.columns(min(len(machine_list), 6))
+    start_times = {}
+    for i, m in enumerate(machine_list):
+        with cols[i % len(cols)]:
+            start_times[m] = st.time_input(f"{m} 開始時刻", value=datetime.strptime("08:00", "%H:%M").time(), key=f"time_{m}")
 
     st.markdown("---")
-    st.header("🛠 シミュレーション設定")
-    sim_speed_up = st.checkbox("⚡ 応援投入（全機械 生産速度20%UP）", value=False)
-    sim_no_overtime = st.checkbox("🚫 残業なし（17:00終了）", value=False)
+    
+    # --- 3. 対象機械の選択と編集 ---
+    selected_machine = st.selectbox("🎯 調整する機械を選択してください", ["すべて"] + machine_list)
+    display_df = raw_df.copy() if selected_machine == "すべて" else raw_df[raw_df['機械'] == selected_machine].copy()
 
-if f_master and f_delivery and f_recv and f_setup:
-    if "raw_data" not in st.session_state:
-        df, m_params = process_data(f_master, f_delivery, f_recv, f_setup)
-        st.session_state.raw_data = df
-        st.session_state.machine_params = m_params
-
-    # 1. 機械フィルター
-    machine_list = ["すべて"] + sorted(st.session_state.raw_data['機械'].unique().tolist())
-    selected_machine = st.selectbox("🎯 対象の機械を選択して予定を表示", machine_list)
-
-    # フィルタリング
-    if selected_machine == "すべて":
-        display_df = st.session_state.raw_data.copy()
-    else:
-        display_df = st.session_state.raw_data[st.session_state.raw_data['機械'] == selected_machine].copy()
-
-    # 2. 編集機能（実行順、数量の変更）
-    st.markdown(f"### 📋 【{selected_machine}】の計画調整 (実行順・数量を編集可能)")
+    st.markdown(f"#### 📋 計画調整ボード (順序・数量を変更して再計算)")
     edited_df = st.data_editor(
         display_df,
         column_config={
-            "実行順": st.column_config.NumberColumn("実行順 (並べ替え)", step=1),
-            "数量": st.column_config.NumberColumn("数量 (分納調整)", min_value=0, step=100),
-            "機械": st.column_config.TextColumn(disabled=True),
-            "優先度": st.column_config.TextColumn(disabled=True),
-            "MCS#": st.column_config.TextColumn(disabled=True),
-            "出荷日": st.column_config.TextColumn(disabled=True),
-            "段取り(分)": None, # 非表示
-            "基準速度(枚/時)": None, # 非表示
-            "エラー状態": None # 非表示
+            "実行順": st.column_config.NumberColumn("順序", step=1, width="small"),
+            "数量": st.column_config.NumberColumn("数量", min_value=0, step=100),
+            "段取り(分)": None, "基準速度(枚/時)": None
         },
-        hide_index=True,
-        use_container_width=True
+        hide_index=True, use_container_width=True
     )
 
-    # 3. リアルタイム再計算ロジック
+    # --- 4. リアルタイム再計算（同アイテム段取りカット含む） ---
     edited_df.sort_values(by='実行順', inplace=True)
-    
-    start_dt = CURRENT_SIM_DATE.replace(hour=8, minute=0)
-    current_times = {} # 機械ごとの現在時刻管理
-    
     calculated_records = []
-    delay_count = 0
+    
+    current_times = {m: datetime.combine(target_date, start_times[m]) for m in machine_list}
+    prev_mcs_map = {m: None for m in machine_list}
 
     for _, row in edited_df.iterrows():
         mach = row['機械']
-        if mach not in current_times: current_times[mach] = start_dt
-        
-        # シミュレーション適用
-        speed = row['基準速度(枚/時)'] * (1.2 if sim_speed_up else 1.0)
-        duration = row['段取り(分)'] + (row['数量'] / speed) * 60
-        
         c_start = current_times[mach]
+        
+        # 同一アイテム連続時の段取りカット
+        is_continuous = (prev_mcs_map[mach] == row['MCS#'])
+        actual_setup = 0 if is_continuous else row['段取り(分)']
+        duration = actual_setup + (row['数量'] / row['基準速度(枚/時)']) * 60
+        
         c_end = add_working_time(c_start, duration)
         
-        # エラー検知（納期遅延）
-        due_date_str = row['出荷日']
-        if due_date_str != '2099-12-31':
-            due_dt = datetime.strptime(due_date_str, "%Y-%m-%d").replace(hour=23, minute=59)
-            if c_end > due_dt:
-                status = "🚨 納期遅延"
-                delay_count += 1
-            else:
-                status = "✅ 正常"
-        else: status = "✅ 正常"
+        status = "🚨 納期遅延" if row['出荷日'] not in ['繰越分', '2099-12-31'] and c_end > datetime.strptime(row['出荷日'], "%Y-%m-%d").replace(hour=23, minute=59) else "✅ 正常"
 
-        row['開始予定'] = c_start.strftime("%m/%d %H:%M")
-        row['終了予定'] = c_end.strftime("%m/%d %H:%M")
+        row['開始'] = c_start.strftime("%m/%d %H:%M")
+        row['終了'] = c_end.strftime("%m/%d %H:%M")
+        row['連続生産'] = "🔄 結合" if is_continuous else "-"
         row['ステータス'] = status
         
         calculated_records.append(row)
         
-        # 次のジョブは30分後
-        current_times[mach] = add_working_time(c_end, 30)
+        current_times[mach] = add_working_time(c_end, 30) # 30分インターバル
+        prev_mcs_map[mach] = row['MCS#']
 
     final_df = pd.DataFrame(calculated_records)
 
-    # 4. サマリー表示 (画面上部へ配置)
-    st.markdown("---")
-    st.markdown("### 📊 稼働状況サマリー")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("総予定数量", f"{final_df['数量'].sum():,} 枚")
-    
-    if delay_count > 0:
-        col2.error(f"⚠️ 納期遅延リスク: {delay_count} 件")
-    else:
-        col2.success("✨ 納期遅延リスク: 0 件")
-        
-    col3.metric("シミュレーション状態", "応援+20%" if sim_speed_up else "標準速度")
+    st.markdown("#### 🕒 シミュレーション結果 (時系列スケジュール)")
+    def highlight_errors(s): return ['background-color: #ffcccc' if s['ステータス'] == '🚨 納期遅延' else 'background-color: #e8f8f5' if s['連続生産'] == '🔄 結合' else '' for _ in s]
+    st.dataframe(final_df[['実行順', '優先度', '機械', 'MCS#', '数量', '連続生産', '開始', '終了', 'ステータス']].style.apply(highlight_errors, axis=1), use_container_width=True)
 
-    # 5. 計算結果の最終確認表 (ステータス・時刻入り)
-    st.markdown("#### 🕒 時系列スケジュール結果")
-    
-    # 納期遅延行をハイライトする処理
-    def highlight_errors(s):
-        return ['background-color: #ffcccc' if s['ステータス'] == '🚨 納期遅延' else '' for _ in s]
-    
-    st.dataframe(final_df[['実行順', '機械', 'MCS#', '数量', '出荷日', '開始予定', '終了予定', 'ステータス']].style.apply(highlight_errors, axis=1), use_container_width=True)
+    csv = final_df.to_csv(index=False, encoding='utf-8-sig')
+    st.download_button("📥 確定したスケジュールをダウンロード", data=csv, file_name=f'plan_{target_date.strftime("%Y%m%d")}.csv', mime='text/csv', type="primary")
 
 else:
-    st.info("👈 左側のサイドバーからデータファイルをアップロードしてください。")
+    st.info("👈 サイドバーから必要なファイルをアップロードしてください。")
