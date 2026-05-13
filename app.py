@@ -56,13 +56,11 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
         if default_idx is not None and len(df.columns) > default_idx: return df.columns[default_idx]
         return None
 
-    # 各種ファイルの読み込み
     master_df = load_file(master_file, skip_rows=3)
     delivery_df = load_file(delivery_file, skip_rows=3)
     setup_speed_df = load_file(setup_file, skip_rows=0)
     for df in [master_df, delivery_df, setup_speed_df]: df.columns = df.columns.astype(str).str.strip()
 
-    # MCS#列の特定 (MasterCard: F列=5, Delivery: D列=3)
     mcs_col_m = find_col(master_df, ['MCS#'], default_idx=5)
     mcs_col_d = find_col(delivery_df, ['MCS#'], default_idx=3)
 
@@ -70,7 +68,6 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
         st.error("MCS#列が特定できませんでした。")
         st.stop()
 
-    # 受入データの構築
     recv_schedule = {}
     if recv_file:
         recv_df = load_file(recv_file, skip_rows=4)
@@ -95,19 +92,34 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
 
     jobs = []
     
-    # 1. 前日繰越 (Floor Track)
+    # 1. 前日繰越 (Floor Track) --- 【今回の大幅改善ポイント】 ---
     if track_file:
         track_df = load_file(track_file, skip_rows=4)
         t_mcs = find_col(track_df, ['MCS#'], default_idx=7)
-        if t_mcs:
+        t_mch = find_col(track_df, ['MCH'], default_idx=4) # MCH（工程）列を直接取得
+        
+        if t_mcs and t_mch:
             for _, t_row in track_df.iterrows():
                 mcs = str(t_row.get(t_mcs, '')).strip()
+                mach = str(t_row.get(t_mch, '')).strip() # Floor Trackから直接機械を特定
+                
+                # 社外工程（CORRなど）や無効な機械はスキップ
+                if not mach or mach in ['nan', 'None', 'FALSE', 'CORR']: continue
+                
                 rem = pd.to_numeric(t_row.get('PLAN OUT', 0), errors='coerce') - pd.to_numeric(t_row.get('GOOD', 0), errors='coerce')
+                
                 if rem > 0:
-                    mach = get_internal_routing(mcs)
-                    if mach: jobs.append({'優先度': 'A (繰越)', '機械': mach, 'MCS#': mcs, '出荷日': '繰越分', '数量': int(rem), '入荷予定': '入荷済', 'recv_dt': None})
+                    jobs.append({
+                        '優先度': 'A (繰越)', 
+                        '機械': mach, # Masterの第1工程ではなく、確実にMCHでスタックしている機械を指定
+                        'MCS#': mcs, 
+                        '出荷日': '工程残', 
+                        '数量': int(rem), 
+                        '入荷予定': '仕掛品(現場有)', # 材料入荷待ちではなく、既に現場にある仕掛品として扱う
+                        'recv_dt': None
+                    })
 
-    # 2. 新規受注 (Delivery) - P列(15)を参照
+    # 2. 新規受注 (Delivery)
     qty_col = find_col(delivery_df, ['ORDER'], default_idx=15)
     due_col = find_col(delivery_df, ['DUE DATE', 'DELIVERY'])
     
@@ -175,19 +187,27 @@ if f_master and f_delivery and f_setup:
     final_recs = []
     for _, row in edited_df.iterrows():
         m = row['機械']
-        orig = raw_df[raw_df['MCS#'] == row['MCS#']].iloc[0]
-        rdt = orig['recv_dt']
-        start = max(current_times[m], rdt.replace(hour=8, minute=0) if pd.notna(rdt) else current_times[m])
+        
+        # 新規受注か繰越かでロジックを分岐
+        if row['優先度'] == 'A (繰越)':
+            start = current_times[m] # 繰越は現場にあるので、入荷日を待たずに即着手可能
+        else:
+            orig = raw_df[raw_df['MCS#'] == row['MCS#']].iloc[0]
+            rdt = orig['recv_dt']
+            start = max(current_times[m], rdt.replace(hour=8, minute=0) if pd.notna(rdt) else current_times[m])
+            
         end = add_working_time(start, 25 + (row['数量'] / 100 * 60))
         row['開始'], row['終了'] = start.strftime("%H:%M"), end.strftime("%H:%M")
+        
         row['状況'] = "正常"
-        if pd.notna(rdt) and rdt.date() > target_date: row['状況'] = f"入荷待ち({row['入荷予定']})"
+        if row['優先度'] != 'A (繰越)' and pd.notna(rdt) and rdt.date() > target_date: 
+            row['状況'] = f"入荷待ち({row['入荷予定']})"
+            
         final_recs.append(row)
         current_times[m] = add_working_time(end, 30)
 
     st.dataframe(pd.DataFrame(final_recs)[['実行順', '優先度', '機械', 'MCS#', '数量', '入荷予定', '開始', '終了', '状況']], use_container_width=True)
     
-    # 文字化け対策(BOM付きUTF-8)でのダウンロード
     csv_buffer = io.BytesIO()
     pd.DataFrame(final_recs).to_csv(csv_buffer, index=False, encoding='utf-8-sig')
     st.download_button(
