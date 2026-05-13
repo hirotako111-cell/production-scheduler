@@ -128,7 +128,7 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
                     if mach:
                         jobs.append({'優先度': 'A (繰越)', '機械': mach, 'MCS#': mcs, '出荷日': '繰越分', '数量': int(rem), '入荷予定': '入荷済', 'recv_dt': None})
 
-    # 2. 新規Delivery (P列 = Index 15) を指定
+    # 2. 新規Delivery (P列 = Index 15)
     qty_col = find_col(delivery_df, ['ORDER'], default_idx=15)
     due_col = find_col(delivery_df, ['DUE DATE', 'DELIVERY'])
     
@@ -148,8 +148,22 @@ def process_data(master_file, delivery_file, setup_file, track_file, recv_file, 
         due_val = str(d_row.get(due_col, '-')) if due_col else '-'
         if due_val == 'nan' or pd.isna(due_val): due_val = '-'
         
+        # 納期に基づく優先度の計算（当日・翌日必達をBとする）
+        rank = 'D (調整)'
+        try:
+            if due_col and pd.notna(d_row[due_col]):
+                # 日付をパースして計画日との差分（slack）を計算
+                ddate = pd.to_datetime(d_row[due_col], dayfirst=True, errors='coerce')
+                if pd.notna(ddate):
+                    slack = (ddate.date() - target_date).days
+                    if slack <= 1: rank = 'B (本日/翌日必達)'
+                    elif slack <= 3: rank = 'C (推奨)'
+                    due_val = ddate.strftime('%Y-%m-%d')
+        except:
+            pass
+        
         jobs.append({
-            '優先度': 'B (通常)', '機械': mach, 'MCS#': mcs, 
+            '優先度': rank, '機械': mach, 'MCS#': mcs, 
             '出荷日': due_val, '数量': int(qty), '入荷予定': recv_str, 'recv_dt': recv_dt
         })
 
@@ -170,17 +184,9 @@ with st.sidebar:
     f_setup = st.file_uploader("3. Setup Speed", type=['csv', 'xlsx'])
     f_track = st.file_uploader("4. Floor Track (実績)", type=['csv', 'xlsx'])
     f_recv = st.file_uploader("5. Receiving Schedule", type=['csv', 'xlsx'])
-    
-    st.markdown("---")
-    show_debug = st.checkbox("🔍 デバッグ情報を表示", value=False)
 
 if f_master and f_delivery and f_setup:
     raw_df = process_data(f_master, f_delivery, f_setup, f_track, f_recv, target_date)
-    
-    if show_debug:
-        st.info("💡 デバッグ情報：システムが認識している列名")
-        st.write("Master:", pd.read_csv(f_master, skiprows=3, nrows=0).columns.tolist()[:10] if f_master.name.endswith('.csv') else pd.read_excel(f_master, skiprows=3, nrows=0).columns.tolist()[:10])
-        st.write("Delivery:", pd.read_csv(f_delivery, skiprows=3, nrows=0).columns.tolist()[:20] if f_delivery.name.endswith('.csv') else pd.read_excel(f_delivery, skiprows=3, nrows=0).columns.tolist()[:20])
 
     if raw_df.empty:
         st.warning("⚠️ ジョブが見つかりませんでした。")
@@ -188,11 +194,16 @@ if f_master and f_delivery and f_setup:
 
     machine_list = sorted(raw_df['機械'].dropna().unique().tolist())
     
-    # グラフを時間単位（Hours）に変更
-    st.markdown("### 📊 全機械 負荷状況 (単位: 時間)")
+    # グラフの計算対象を「ランクAとB」に絞る
+    st.markdown("### 📊 本日・翌日必達分の負荷状況 (単位: 時間)")
+    st.caption("※前日からの繰越分（ランクA）と、本日・翌日納期分（ランクB）のみを合算してグラフ化しています。遠い将来の受注分は含まれません。")
+    
     workload_data = []
+    # AとBの優先度を持つジョブだけを抽出
+    target_df = raw_df[raw_df['優先度'].str.contains('A|B', na=False)]
+    
     for m in machine_list:
-        m_df = raw_df[raw_df['機械'] == m]
+        m_df = target_df[target_df['機械'] == m]
         total_mins = len(m_df) * 25 + (m_df['数量'].sum() / 100 * 60)
         total_hours = total_mins / 60.0  # 分を時間に変換
         workload_data.append({'機械': m, '稼働予定(時間)': round(total_hours, 1)})
